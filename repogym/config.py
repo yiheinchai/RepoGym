@@ -47,6 +47,7 @@ DEFAULTS: Dict[str, Any] = {
         "url": None,               # s3://bucket/prefix | gs://bucket/prefix | file:///mnt/share/repogym
         "auto_sync": True,         # push each task right after it is built
         "purge_local": False,      # delete the local task dir once pushed
+        "mirror": True,            # keep each repository's git history in the bucket (dedup'd, incremental)
         "tiers": None,             # e.g. ["verified", "suite"] to keep unverified tasks local only
         "aws_profile": None,
         "s3_endpoint_url": None,   # MinIO / R2 / Ceph

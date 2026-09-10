@@ -105,10 +105,24 @@ repogym remote ls --tier verified          # what the organisation has
 repogym pull --all                         # fetch everything into ~/.repogym/cache
 ```
 
-Bucket layout: `<prefix>/tasks/<task_id>/{task.json, problem.md, solution.patch, source.patch, test.patch,
-base.patch, trajectory.jsonl, snapshots.bundle}` plus `<prefix>/index.jsonl` (one task per line; rebuild
-with `repogym remote index`). A task is ~30 KB, so a million tasks is tens of GB of object storage and
-the laptops carry nothing.
+Bucket layout:
+
+```
+<prefix>/tasks/<task_id>/   task.json, problem.md, solution.patch, source.patch, test.patch,
+                            base.patch, trajectory.jsonl, snapshots.bundle          (~30 KB per task)
+<prefix>/repos/<repo_id>/   manifest.json + bundles/0000-….bundle (full), 0001-….bundle (thin), …
+<prefix>/index.jsonl        one task per line; rebuild with `repogym remote index`
+```
+
+**The environment travels with the gym.** A task is a delta on top of a repository's history, so
+RepoGym mirrors each repository into the bucket once (a full git bundle of all refs, including the
+snapshot pins) and afterwards appends only thin bundles with the objects that are new since the
+last push. Git's content addressing does the deduplication; a thousand tasks from one repo share one
+mirror. Before a task is uploaded, `sync` checks that its commits are covered and pushes an increment
+if not. On the training side the mirror is restored by fetching the bundles in order, so tasks stay
+reproducible if the upstream repo is renamed, deleted, force-pushed or the git host is unreachable.
+The git remote recorded in the task is only a fallback. `repogym mirror status|push|restore` manages
+this by hand; `remote.mirror=false` turns it off.
 
 Backends: `s3://` uses boto3 when installed (`pip install repogym[s3]`), otherwise the `aws` CLI;
 `gs://` uses the `gcloud` CLI; `file://` or a plain path covers NFS and shared drives. Authentication is

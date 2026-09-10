@@ -399,6 +399,47 @@ def cmd_pull(args) -> int:
     return 0
 
 
+def cmd_mirror(args) -> int:
+    from . import gitsnap
+    from .mirror import mirror_status, push_mirror, restore_mirror
+    from .remote import open_remote
+    store = _store()
+    remote = open_remote(args.remote)
+    if args.action == "push":
+        repo = gitsnap.find_repo_root(Path(args.repo or os.getcwd()))
+        if repo is None:
+            print("not a git repository", file=sys.stderr)
+            return 1
+        meta = store.register_repo(repo, remote=gitsnap.remote_url(repo))
+        rec = push_mirror(remote, repo, meta["id"], meta["name"], meta.get("remote"), force_full=args.full)
+        if rec is None:
+            print(f"{meta['name']}: mirror already up to date")
+        else:
+            print(f"{meta['name']}: pushed {rec['name']} ({rec['bytes'] / 1024:.0f} KB, {'thin' if rec['thin'] else 'full'})")
+        return 0
+    if args.action == "restore":
+        from .clones import clone_root
+        m = None
+        for r in store.repos():
+            if r["id"] == args.repo or r["name"] == args.repo:
+                m = r
+        repo_id = m["id"] if m else args.repo
+        name = m["name"] if m else args.repo
+        dest = restore_mirror(remote, repo_id, clone_root(store.root) / name)
+        print(f"restored to {dest}" if dest else "no mirror for that repo in the remote")
+        return 0 if dest else 1
+    # status
+    ids = {r["id"]: r["name"] for r in store.repos()}
+    for rid in sorted(set(ids) | set(remote.list_dirs("repos/"))):
+        st = mirror_status(remote, rid)
+        if st:
+            print(f"{rid}  {st['name'] or ids.get(rid, ''):<24} bundles={st['bundles']} "
+                  f"size={st['bytes'] / 1024 / 1024:.1f} MB covered_heads={st['covered']} updated={st['updated_at']}")
+        else:
+            print(f"{rid}  {ids.get(rid, ''):<24} (not mirrored)")
+    return 0
+
+
 def cmd_delete(args) -> int:
     store = _store()
     for tid in args.task:
@@ -529,6 +570,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_pull)
+
+    s = sub.add_parser("mirror", help="repository history in the bucket: status | push | restore")
+    s.add_argument("action", nargs="?", choices=["status", "push", "restore"], default="status")
+    s.add_argument("repo", nargs="?", help="push: repo path (default cwd); restore: repo id or name")
+    s.add_argument("--remote")
+    s.add_argument("--full", action="store_true", help="push: force a fresh full bundle")
+    s.set_defaults(fn=cmd_mirror)
 
     s = sub.add_parser("gc", help="unpin old snapshots, rotate logs, report disk usage")
     s.add_argument("--days", type=int, help="retention in days (default: config snapshot_retention_days)")

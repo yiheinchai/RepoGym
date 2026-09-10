@@ -36,26 +36,28 @@ from .verify import (TIER_SUITE, TIER_VERIFIED, locate_repo, materialize, reset_
 Obs = Dict[str, Any]
 
 
-def resolve_task(task: str, store: Store) -> Tuple[dict, Path]:
+def resolve_task(task: str, store: Store) -> Tuple[dict, Path, Any]:
     """Accept a task directory, a local task id, a remote task URL (s3://.../tasks/<id>) or an id
-    that only exists in the configured remote. Returns (task.json contents, local task dir)."""
+    that only exists in the configured remote. Returns (task.json, local task dir, remote or None)."""
     from .remote import pull_task, split_task_url, open_remote
     p = Path(str(task)).expanduser()
     if (p / "task.json").exists():
-        return read_json(p / "task.json"), p
+        return read_json(p / "task.json"), p, None
     local = store.task_dir(str(task))
     if (local / "task.json").exists():
-        return read_json(local / "task.json"), local
+        return read_json(local / "task.json"), local, None
     parts = split_task_url(str(task))
     if parts:
         base_url, tid = parts
-        tdir = pull_task(store, tid, remote=open_remote(base_url))
-        return read_json(tdir / "task.json"), tdir
+        remote = open_remote(base_url)
+        tdir = pull_task(store, tid, remote=remote)
+        return read_json(tdir / "task.json"), tdir, remote
     cached = store.root / "cache" / "tasks" / str(task)
     if (cached / "task.json").exists():
-        return read_json(cached / "task.json"), cached
-    tdir = pull_task(store, str(task))  # configured remote
-    return read_json(tdir / "task.json"), tdir
+        return read_json(cached / "task.json"), cached, None
+    remote = open_remote()
+    tdir = pull_task(store, str(task), remote=remote)  # configured remote
+    return read_json(tdir / "task.json"), tdir, remote
 
 
 class RepoGymEnv:
@@ -68,13 +70,13 @@ class RepoGymEnv:
                  output_limit: int = 20000):
         self.store = store or Store()
         self.cfg = cfg or config.load_config()
-        self.task, self.task_dir = resolve_task(task, self.store)
+        self.task, self.task_dir, bucket = resolve_task(task, self.store)
         self.files = task_files(self.task_dir)
         self.repo = Path(repo) if repo else locate_repo(self.task, self.store.root)
         if self.repo is None:
-            # Training box: no engineer checkout here. Clone from the recorded remote.
+            # Training box: no engineer checkout here. Restore from the bucket mirror, else clone.
             from .clones import ensure_repo
-            self.repo = ensure_repo(self.task, self.task_dir, self.store.root)
+            self.repo = ensure_repo(self.task, self.task_dir, self.store.root, bucket=bucket)
         self.workdir = Path(workdir) if workdir else None
         self.hidden_tests = hidden_tests
         self.timeout = timeout

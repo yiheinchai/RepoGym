@@ -170,8 +170,9 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
         "id": task_id,
         "title": title,
         "created_at": now_iso(),
-        "repo": {"name": repo_name, "path": str(repo), "remote": repo_meta.get("remote")},
+        "repo": {"id": ep.repo_id, "name": repo_name, "path": str(repo), "remote": repo_meta.get("remote")},
         "language": language,
+        "toolchain": _toolchain(runner),
         "base_commit": base,
         "head_commit": ep.base.get("head"),
         "branch": ep.base.get("branch"),
@@ -271,6 +272,25 @@ def _derive_tier(before: RunResult, after: RunResult, test_files: List[str]) -> 
     if after.returncode != 0:
         return TIER_UNVERIFIED, [], [], f"reference solution fails the suite (exit {after.returncode})"
     return TIER_UNVERIFIED, [], [], "suite passes before and after; no discriminating tests"
+
+
+def _toolchain(runner: Optional[str]) -> dict:
+    """Record interpreter/toolchain versions so a container can be built to match later."""
+    import platform
+    import shutil
+    import subprocess
+    info = {"platform": platform.platform(), "python": platform.python_version()}
+    probes = {"node": ["node", "--version"], "go": ["go", "version"], "cargo": ["cargo", "--version"],
+              "ruby": ["ruby", "--version"], "java": ["java", "-version"]}
+    for name, cmd in probes.items():
+        if shutil.which(cmd[0]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                info[name] = (out.stdout or out.stderr).strip().splitlines()[0][:80]
+            except Exception:  # noqa: BLE001
+                pass
+    info["runner"] = runner
+    return info
 
 
 def _summ(r: Optional[RunResult]) -> Optional[dict]:

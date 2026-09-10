@@ -364,11 +364,37 @@ def sync_task(store, task_id: str, remote: Optional[Remote] = None, purge_local:
     rcfg = cfg.get("remote", {}) or {}
     remote = remote or open_remote(cfg=cfg)
     purge = rcfg.get("purge_local", False) if purge_local is None else purge_local
+    task = read_json(store.task_dir(task_id) / "task.json") or {}
+    if rcfg.get("mirror", True):
+        _ensure_mirror_for_task(task, remote)
     pushed = remote.push_task(store.task_dir(task_id))
     mark_synced(store.root, task_id, remote.url)
     if purge:
         store.delete_task(task_id)
     return pushed
+
+
+def _ensure_mirror_for_task(task: dict, remote: Remote) -> None:
+    """The environment travels with the task: make sure its repository history is in the bucket."""
+    repo_meta = task.get("repo") or {}
+    repo_path = Path(repo_meta.get("path") or "")
+    repo_id = repo_meta.get("id")
+    if not repo_id or not repo_path.exists():
+        return
+    from .mirror import ensure_covered
+    # Prefer covering the exact snapshot commits (they include head_commit as parent).
+    for commit in (task.get("final_commit"), task.get("base_commit"), task.get("head_commit")):
+        if commit and gitsnap_exists(repo_path, commit):
+            ensure_covered(remote, repo_path, repo_id, repo_meta.get("name") or repo_path.name, commit,
+                           url=repo_meta.get("remote"))
+            return
+    ensure_covered(remote, repo_path, repo_id, repo_meta.get("name") or repo_path.name, None,
+                   url=repo_meta.get("remote"))
+
+
+def gitsnap_exists(repo: Path, sha: str) -> bool:
+    from . import gitsnap
+    return gitsnap.commit_exists(repo, sha)
 
 
 def sync_all(store, remote: Optional[Remote] = None, purge_local: Optional[bool] = None, force: bool = False,

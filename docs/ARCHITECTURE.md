@@ -29,7 +29,8 @@
 | `export` | SWE-bench / full JSONL, git bundle |
 | `llm` | optional problem-statement rewriting (Anthropic SDK, structured output) |
 | `remote` | object-store backends (S3 via boto3/aws CLI, GCS via gcloud, directory), task push/pull/index, sync markers |
-| `clones` | on-demand blobless clones under `~/.repogym/clones`, fetch `head_commit`, unbundle snapshots |
+| `mirror` | per-repo git history in the bucket: full bundle then thin increments, manifest of covered heads, restore |
+| `clones` | local clones under `~/.repogym/clones`: restore from the bucket mirror, else clone the git remote |
 | `gc` | snapshot unpinning by retention, log rotation, disk accounting |
 | `cli` | `repogym …` |
 
@@ -79,18 +80,24 @@ that only have the upstream history.
 
 ## Portability: how a task runs on a machine that never saw the engineer's checkout
 
-A task references two commits: `head_commit` (real, expected to exist upstream) and `base_commit`
-(synthetic snapshot, exists only where it was created). Three layers make the base reproducible
-anywhere, tried in order by `verify.materialize` / `clones.ensure_repo`:
+A task references two commits: `head_commit` (real) and `base_commit` (synthetic snapshot). Where the
+history comes from, in order (`clones.ensure_repo`):
 
-1. the snapshot commit itself, if present (engineer's machine, or restored from `snapshots.bundle`);
-2. `snapshots.bundle`, a thin git bundle of the base and final commits with `head_commit` as
-   prerequisite (a few KB; unbundled into the clone after `head_commit` is fetched);
-3. `head_commit` + `base.patch` (text diff of the engineer's uncommitted work at prompt time).
+1. an existing local clone or the engineer's checkout;
+2. **the bucket mirror** (`repos/<repo_id>/`): a full `git bundle --all` made on first sync, then thin
+   bundles built with `^<previously covered heads>` so only new objects are uploaded. `--all` includes
+   `refs/repogym/snapshots/*`, so the exact snapshot commits are mirrored while they are pinned. Restore
+   = `git fetch <bundle>` in manifest order into a local clone; a state file records applied bundles;
+3. the git remote recorded in the task, as a fallback when no mirror exists.
 
-The only hard requirement is that `head_commit` be reachable from the git remote. Tasks built on
-unpushed local commits are still valid on the engineer's machine but not elsewhere; `repo.remote` and
-`head_commit` are in `task.json` so a loader can filter them.
+Within a restored repo, `verify.materialize` uses the snapshot commit if present, else `snapshots.bundle`
+(thin bundle with `head_commit` as prerequisite), else `head_commit` + `base.patch`.
+
+Consequence: with mirroring on (default), the bucket alone reproduces every task. Renames, deletions and
+history rewrites upstream do not invalidate the gym. The mirror costs roughly the repository's `.git`
+size once, plus deltas; tasks stay tiny. What the mirror does *not* carry is the toolchain (interpreter,
+installed packages). Tasks record detected versions under `toolchain` so a container image can be built
+to match; that is the next layer.
 
 ## Reward
 
