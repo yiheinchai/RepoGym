@@ -1,5 +1,6 @@
 # Examples
 
+- `train_loader.py` — iterate tasks straight from the S3/GCS remote and run a policy on each.
 - `replay_gold.py` — sanity check every verified task: the engineer's own patch must score 1.0.
 - `claude_code_policy.py` — use Claude Code (`claude -p`) as a policy inside the gym and grade it.
 - `gymnasium_env.py` — the gymnasium wrapper with string observations / actions.

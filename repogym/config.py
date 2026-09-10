@@ -42,6 +42,25 @@ DEFAULTS: Dict[str, Any] = {
         ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*",
         "*.keystore", "*credentials*", "*secret*", "*.tfstate", "*.tfstate.*",
     ],
+    # --- shared remote (the organisation's gym) -------------------------------------------------
+    "remote": {
+        "url": None,               # s3://bucket/prefix | gs://bucket/prefix | file:///mnt/share/repogym
+        "auto_sync": True,         # push each task right after it is built
+        "purge_local": False,      # delete the local task dir once pushed
+        "tiers": None,             # e.g. ["verified", "suite"] to keep unverified tasks local only
+        "aws_profile": None,
+        "s3_endpoint_url": None,   # MinIO / R2 / Ceph
+        "s3_extra_args": {},       # boto3 ExtraArgs, e.g. {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": "..."}
+    },
+    # --- storage controls ---------------------------------------------------------------------
+    # Untracked files larger than this are left out of snapshots (build artifacts, datasets...).
+    "max_file_size_mb": 5,
+    # Days to keep snapshot commits pinned after an episode is built/skipped. Tasks stay usable:
+    # they carry head_commit + base.patch. 0 = unpin right after build, -1 = keep forever.
+    "snapshot_retention_days": 7,
+    # Keep an audit log of hook events (rotated at log_max_mb).
+    "event_log": True,
+    "log_max_mb": 5,
     # Minimum / maximum diff size (lines) for a task to be worth keeping.
     "min_diff_lines": 1,
     "max_diff_lines": 20000,

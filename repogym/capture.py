@@ -42,8 +42,14 @@ class Capture:
         meta = self.store.register_repo(repo, remote=gitsnap.remote_url(repo))
         return meta["id"]
 
+    def _snap(self, repo: Path, label: str):
+        return gitsnap.snapshot(repo, label, max_file_size_mb=float(self.cfg.get("max_file_size_mb") or 0))
+
     def log(self, repo: Path, event: dict) -> None:
+        if not self.cfg.get("event_log", True):
+            return
         rid = self.store.repo_id_for(repo)
+        rotate_if_large(self.store.repo_dir(rid) / "events.jsonl", float(self.cfg.get("log_max_mb") or 5))
         ev = {"ts": now_iso()}
         ev.update(scrub_obj(event))
         self.store.log_event(rid, ev)
@@ -57,7 +63,7 @@ class Capture:
             ep = self.store.open_episode(rid, session_id)
             if ep is None:
                 ep = self.store.new_episode(repo, agent, session_id)
-                snap = gitsnap.snapshot(repo, f"{ep.id}-base")
+                snap = self._snap(repo, f"{ep.id}-base")
                 ep.base = snap.to_dict()
                 if meta:
                     ep.meta.update(scrub_obj(meta))
@@ -123,7 +129,7 @@ class Capture:
             ep = self.store.open_episode(rid, session_id)
             if ep is None:
                 return None
-            snap = gitsnap.snapshot(repo, f"{ep.id}-final")
+            snap = self._snap(repo, f"{ep.id}-final")
             ep.final = snap.to_dict()
             ep.ended_at = now_iso()
             ep.status = "closed"
@@ -175,6 +181,15 @@ def _shrink(obj, limit: int = 8000):
     return obj
 
 
+def rotate_if_large(path: Path, max_mb: float) -> None:
+    """Keep append-only logs bounded: rename to .1 (replacing the previous .1) once over max_mb."""
+    try:
+        if max_mb > 0 and path.exists() and path.stat().st_size > max_mb * 1024 * 1024:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
 def spawn_builder(home: Path) -> Optional[int]:
     """Start a detached background process that drains the build queue.
 
@@ -184,6 +199,7 @@ def spawn_builder(home: Path) -> Optional[int]:
         return None
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    rotate_if_large(log_dir / "builder.log", 5)
     log = open(log_dir / "builder.log", "ab")
     env = dict(os.environ)
     env[config.ENV_HOME] = str(home)

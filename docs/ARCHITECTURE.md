@@ -28,6 +28,9 @@
 | `env` | `RepoGymEnv` (+ gymnasium wrapper) |
 | `export` | SWE-bench / full JSONL, git bundle |
 | `llm` | optional problem-statement rewriting (Anthropic SDK, structured output) |
+| `remote` | object-store backends (S3 via boto3/aws CLI, GCS via gcloud, directory), task push/pull/index, sync markers |
+| `clones` | on-demand blobless clones under `~/.repogym/clones`, fetch `head_commit`, unbundle snapshots |
+| `gc` | snapshot unpinning by retention, log rotation, disk accounting |
 | `cli` | `repogym …` |
 
 ## Episode lifecycle (Claude Code)
@@ -73,6 +76,21 @@ Snapshot commits are synthetic (their parent is the real HEAD). To make tasks po
 they asked for help). `verify.materialize` first tries the snapshot commit, then falls back to
 `head_commit + base.patch`. `repogym bundle` exports the snapshot refs as a git bundle for machines
 that only have the upstream history.
+
+## Portability: how a task runs on a machine that never saw the engineer's checkout
+
+A task references two commits: `head_commit` (real, expected to exist upstream) and `base_commit`
+(synthetic snapshot, exists only where it was created). Three layers make the base reproducible
+anywhere, tried in order by `verify.materialize` / `clones.ensure_repo`:
+
+1. the snapshot commit itself, if present (engineer's machine, or restored from `snapshots.bundle`);
+2. `snapshots.bundle`, a thin git bundle of the base and final commits with `head_commit` as
+   prerequisite (a few KB; unbundled into the clone after `head_commit` is fetched);
+3. `head_commit` + `base.patch` (text diff of the engineer's uncommitted work at prompt time).
+
+The only hard requirement is that `head_commit` be reachable from the git remote. Tasks built on
+unpushed local commits are still valid on the engineer's machine but not elsewhere; `repo.remote` and
+`head_commit` are in `task.json` so a loader can filter them.
 
 ## Reward
 

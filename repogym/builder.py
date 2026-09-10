@@ -64,7 +64,26 @@ def build_episode(ep: Episode, store: Store, cfg: Optional[dict] = None, llm: Op
     store.save_episode(ep)
     _log(quiet, f"[repogym] built {task['id']} tier={task['tier']} F2P={len(task['FAIL_TO_PASS'])} "
                 f"P2P={len(task['PASS_TO_PASS'])}")
+    _auto_sync(task, store, cfg, quiet)
     return task
+
+
+def _auto_sync(task: dict, store: Store, cfg: dict, quiet: bool) -> None:
+    rcfg = cfg.get("remote", {}) or {}
+    import os
+    if not (rcfg.get("url") or os.environ.get("REPOGYM_REMOTE")) or not rcfg.get("auto_sync", True):
+        return
+    tiers = rcfg.get("tiers")
+    if tiers and task.get("tier") not in tiers:
+        return
+    try:
+        from .remote import sync_task
+        sync_task(store, task["id"], cfg=cfg)
+        _log(quiet, f"[repogym] pushed {task['id']} -> {rcfg.get('url') or os.environ.get('REPOGYM_REMOTE')}")
+    except Exception as e:  # noqa: BLE001 - `repogym sync` retries later
+        _log(quiet, f"[repogym] sync failed for {task['id']}: {e}")
+        with open(store.root / "logs" / "sync-errors.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{now_iso()} {task['id']}: {type(e).__name__}: {e}\n")
 
 
 def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, quiet: bool) -> dict:
@@ -202,6 +221,13 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
         traj.unlink()
     for rec in ep.tools:
         append_jsonl(traj, rec)
+    # Thin bundle of the two snapshot commits (objects not already in head_commit): usually a few KB,
+    # and it lets another machine restore the *exact* base/final commits given the upstream history.
+    if head:
+        try:
+            gitsnap.export_bundle(repo, tdir / "snapshots.bundle", [ep.base["ref"], ep.final["ref"], f"^{head}"])
+        except Exception:  # noqa: BLE001 - optional
+            pass
     return task
 
 
@@ -278,6 +304,8 @@ def drain_queue(store: Store, cfg: Optional[dict] = None, quiet: bool = False, l
         finally:
             store.finish_job(job)
         n += 1
+    from .gc import housekeeping
+    housekeeping(store)
     return n
 
 

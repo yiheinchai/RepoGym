@@ -23,6 +23,7 @@ dependencies = []
 
 [project.optional-dependencies]
 llm = ["anthropic>=1.0"]
+s3 = ["boto3>=1.28"]
 gym = ["gymnasium>=0.29"]
 dev = ["pytest>=7"]
 

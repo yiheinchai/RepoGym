@@ -52,10 +52,12 @@ pip install -e .            # or: pipx install .     (no required dependencies)
 repogym init
 repogym install claude-code # writes hooks to ~/.claude/settings.json  (--scope project for one repo)
 repogym install codex       # writes notify = ["repogym", "codex-notify"] to ~/.codex/config.toml
+repogym remote set s3://acme-repogym/gym   # the organisation's bucket (gs:// and file:// work too)
 ```
 
 Now just work. Each prompt → stop cycle that changes files becomes an episode; a detached builder
-turns it into a task within seconds to minutes (it runs your tests twice).
+turns it into a task within seconds to minutes (it runs your tests twice) and pushes it to the bucket.
+Laptops are only a capture point: set `remote.purge_local` to keep nothing there.
 
 ```bash
 repogym status
@@ -70,7 +72,7 @@ repogym export --format swebench -o gym.jsonl --tier verified
 ```python
 from repogym import RepoGymEnv
 
-env = RepoGymEnv("myrepo__fix-divide-by-zero__1a2b3c4d")     # task id or task directory
+env = RepoGymEnv("s3://acme-repogym/gym/tasks/myrepo__fix-divide-by-zero__1a2b3c4d")  # or a local id / dir
 obs, info = env.reset()
 print(obs["problem_statement"], obs["repo_path"])
 
@@ -82,9 +84,39 @@ env.close()
 ```
 
 `reward` is 1.0 when every `FAIL_TO_PASS` test passes and no `PASS_TO_PASS` test regresses
-(partial credit for a fraction of F2P with no regressions; configurable). See
-[`examples/`](examples/) for a policy that uses Claude Code itself as the agent, and for the
-gymnasium wrapper.
+(partial credit for a fraction of F2P with no regressions; configurable). On a training box the env
+pulls the task from the bucket, clones the repository from the git remote recorded in the task
+(blobless partial clone, under `~/.repogym/clones/`), fetches `head_commit` and restores the exact
+snapshot commits from the task's thin `snapshots.bundle`. See [`examples/`](examples/) for a
+training-side loader, a policy that uses Claude Code itself as the agent, and the gymnasium wrapper.
+
+## The shared gym: S3 / GCS / shared directory
+
+```
+laptop A ─┐                                     ┌─ training job:  for task in iter_tasks("s3://acme-repogym/gym"):
+laptop B ─┼─ build ─► sync ─► s3://acme-repogym/gym ─┤                       env = RepoGymEnv(task["remote_url"])
+laptop C ─┘                                     └─ eval / export:  repogym pull --all ; repogym export --format swebench
+```
+
+```bash
+repogym remote set s3://acme-repogym/gym   # once per machine; or export REPOGYM_REMOTE=...
+repogym sync --purge-local --index         # push anything not yet pushed, drop local copies, rebuild index.jsonl
+repogym remote ls --tier verified          # what the organisation has
+repogym pull --all                         # fetch everything into ~/.repogym/cache
+```
+
+Bucket layout: `<prefix>/tasks/<task_id>/{task.json, problem.md, solution.patch, source.patch, test.patch,
+base.patch, trajectory.jsonl, snapshots.bundle}` plus `<prefix>/index.jsonl` (one task per line; rebuild
+with `repogym remote index`). A task is ~30 KB, so a million tasks is tens of GB of object storage and
+the laptops carry nothing.
+
+Backends: `s3://` uses boto3 when installed (`pip install repogym[s3]`), otherwise the `aws` CLI;
+`gs://` uses the `gcloud` CLI; `file://` or a plain path covers NFS and shared drives. Authentication is
+whatever those tools already use. MinIO / R2 / Ceph work via `remote.s3_endpoint_url`. Server-side
+encryption or a KMS key goes in `remote.s3_extra_args`.
+
+The bucket contains your source code. Treat it like a repo mirror: private bucket, SSE, least-privilege
+IAM (writers need `PutObject` on `tasks/*`, trainers need `GetObject`/`ListBucket`).
 
 ## How it works
 
@@ -127,8 +159,49 @@ More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `exclude_globs` | .env, *.pem, *secret*, … | files dropped from every stored patch |
 | `llm.enabled` | `false` | rewrite prompts into clean issue-style problem statements (Anthropic API) |
 | `max_diff_lines` | `20000` | skip huge episodes |
+| `remote.url` | `null` | `s3://bucket/prefix`, `gs://bucket/prefix` or `file:///path` (`REPOGYM_REMOTE` overrides) |
+| `remote.auto_sync` | `true` | push each task as soon as it is built |
+| `remote.purge_local` | `false` | delete the local task directory once pushed |
+| `remote.tiers` | `null` | only push these tiers (e.g. `["verified","suite"]`) |
+| `remote.aws_profile` / `s3_endpoint_url` / `s3_extra_args` | — | AWS profile, custom S3 endpoint, boto3 `ExtraArgs` (SSE/KMS) |
+| `max_file_size_mb` | `5` | untracked files above this never enter a snapshot |
+| `snapshot_retention_days` | `7` | unpin snapshot commits this long after a task is built (`0` = immediately, `-1` = keep) |
+| `event_log` / `log_max_mb` | `true` / `5` | hook audit log on/off and rotation size for all logs |
 
 Set `REPOGYM_HOME` to relocate the store (e.g. a shared volume or a per-team directory).
+
+## Local footprint
+
+With a remote configured and `purge_local` on, a laptop keeps only episode records (~5 KB each) and
+transient scratch worktrees. Without a remote, RepoGym still does not copy repositories. Measured on
+the test fixture:
+
+| what | where | size |
+|---|---|---|
+| one task (patches, problem, trajectory, metadata) | `~/.repogym/tasks/<id>/` | ~30 KB |
+| one episode record + audit events | `~/.repogym/repos/<id>/` | ~5 KB |
+| snapshot objects for a typical turn | the repo's own `.git` | a few KB (unchanged files dedupe against HEAD) |
+| scratch worktree during a build | `$TMPDIR` | one checkout of the repo, deleted after the run |
+
+Two things are actively controlled:
+
+- **Big untracked files.** A build artifact or dataset that is not gitignored would otherwise be
+  committed into a snapshot. Files over `max_file_size_mb` are excluded (recorded as `skipped_large`).
+- **Pinned snapshots.** Snapshot commits are pinned under `refs/repogym/` so the builder can diff them.
+  After a task is built they are no longer needed: the task directory holds `head_commit`, `base.patch`
+  and the solution/test patches, and `RepoGymEnv` reconstructs the base state from those. The builder
+  unpins finished episodes after `snapshot_retention_days`; git's normal gc then reclaims the objects.
+
+```bash
+repogym status                 # shows store size and pinned snapshot bytes per repo
+repogym gc --dry-run           # what would be unpinned now
+repogym gc --days 0 --git-gc   # unpin everything finished and let git gc reclaim (default 2-week expiry)
+repogym gc --prune-now         # reclaim immediately
+```
+
+Only one builder runs at a time (a lock in `~/.repogym`), so at most one scratch worktree exists.
+Logs and the event audit trail rotate at `log_max_mb`. For a shared team store, point `REPOGYM_HOME`
+at a network volume; the per-machine cost is then just the transient worktree.
 
 ### Opting out
 

@@ -15,9 +15,9 @@ import contextlib
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 from .util import CommandError, git
 
@@ -33,13 +33,15 @@ class Snapshot:
     branch: Optional[str]
     dirty: bool            # working tree differed from HEAD
     ref: str
+    skipped_large: List[str] = field(default_factory=list)  # untracked files left out for size
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
     def from_dict(d: dict) -> "Snapshot":
-        return Snapshot(**{k: d.get(k) for k in ("commit", "tree", "head", "branch", "dirty", "ref")})
+        return Snapshot(**{k: d.get(k) for k in ("commit", "tree", "head", "branch", "dirty", "ref")},
+                        skipped_large=list(d.get("skipped_large") or []))
 
 
 def find_repo_root(path: os.PathLike) -> Optional[Path]:
@@ -78,11 +80,33 @@ def remote_url(repo: Path) -> Optional[str]:
     return url
 
 
-def snapshot(repo: Path, label: str) -> Snapshot:
-    """Create a pinned snapshot commit of the current working tree of `repo`."""
+def large_untracked_files(repo: Path, max_bytes: int) -> List[str]:
+    """Untracked, non-ignored files bigger than max_bytes. These are almost never source code."""
+    if max_bytes <= 0:
+        return []
+    out = git(["ls-files", "-o", "--exclude-standard", "-z"], cwd=repo).stdout
+    big = []
+    for rel in out.split("\0"):
+        if not rel:
+            continue
+        try:
+            if os.path.getsize(repo / rel) > max_bytes:
+                big.append(rel)
+        except OSError:
+            continue
+    return big
+
+
+def snapshot(repo: Path, label: str, max_file_size_mb: float = 0) -> Snapshot:
+    """Create a pinned snapshot commit of the current working tree of `repo`.
+
+    Untracked files larger than max_file_size_mb (0 = no limit) are excluded so a stray build
+    artifact cannot bloat the repository's object store.
+    """
     repo = Path(repo)
     gdir = git_dir(repo)
     head = head_commit(repo)
+    skipped = large_untracked_files(repo, int(max_file_size_mb * 1024 * 1024)) if max_file_size_mb else []
     fd, tmp_index = tempfile.mkstemp(prefix="repogym-index-", dir=str(gdir))
     os.close(fd)
     os.unlink(tmp_index)  # git wants to create it itself
@@ -91,7 +115,8 @@ def snapshot(repo: Path, label: str) -> Snapshot:
         if head:
             git(["read-tree", head], cwd=repo, env=env)
         # Stage everything (respects .gitignore). -f is *not* used: ignored files stay out.
-        git(["add", "-A", "--", "."], cwd=repo, env=env)
+        add_args = ["add", "-A", "--", "."] + [f":(exclude,literal){p}" for p in skipped]
+        git(add_args, cwd=repo, env=env)
         tree = git(["write-tree"], cwd=repo, env=env).stdout.strip()
         head_tree = git(["rev-parse", f"{head}^{{tree}}"], cwd=repo).stdout.strip() if head else EMPTY_TREE
         dirty = tree != head_tree
@@ -105,7 +130,8 @@ def snapshot(repo: Path, label: str) -> Snapshot:
         commit = git(args, cwd=repo, env=commit_env).stdout.strip()
         ref = f"{REF_PREFIX}/{label}"
         git(["update-ref", ref, commit], cwd=repo)
-        return Snapshot(commit=commit, tree=tree, head=head, branch=current_branch(repo), dirty=dirty, ref=ref)
+        return Snapshot(commit=commit, tree=tree, head=head, branch=current_branch(repo), dirty=dirty, ref=ref,
+                        skipped_large=skipped)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_index)
@@ -115,6 +141,42 @@ def snapshot(repo: Path, label: str) -> Snapshot:
 
 def delete_snapshot_ref(repo: Path, ref: str) -> None:
     git(["update-ref", "-d", ref], cwd=repo, check=False)
+
+
+def snapshot_refs(repo: Path) -> List[str]:
+    out = git(["for-each-ref", "--format=%(refname)", REF_PREFIX], cwd=repo, check=False).stdout
+    return [l for l in out.splitlines() if l.strip()]
+
+
+def snapshot_footprint(repo: Path) -> Tuple[int, int]:
+    """(object count, bytes) reachable only from snapshot refs, i.e. what RepoGym adds to .git."""
+    refs = snapshot_refs(repo)
+    if not refs:
+        return 0, 0
+    objs = git(["rev-list", "--objects", *refs, "--not", "--branches", "--remotes", "--tags"], cwd=repo,
+               check=False).stdout
+    ids = [l.split()[0] for l in objs.splitlines() if l.strip()]
+    if not ids:
+        return 0, 0
+    from .util import run
+    proc = run(["git", "cat-file", "--batch-check=%(objectsize)"], cwd=repo, check=False,
+               input_text="\n".join(ids) + "\n")
+    total = 0
+    for line in proc.stdout.splitlines():
+        try:
+            total += int(line.strip())
+        except ValueError:
+            pass
+    return len(ids), total
+
+
+def garbage_collect(repo: Path, prune_now: bool = False) -> None:
+    """Run git gc. Unpinned snapshot objects are pruned after git's default expiry (2 weeks)
+    unless prune_now is set."""
+    args = ["gc", "--quiet"]
+    if prune_now:
+        args.append("--prune=now")
+    git(args, cwd=repo, check=False, timeout=1800)
 
 
 def diff(repo: Path, a: str, b: str, paths: Sequence[str] = (), exclude: Sequence[str] = (),

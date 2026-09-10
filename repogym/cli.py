@@ -154,7 +154,14 @@ def cmd_build(args) -> int:
                     time.sleep(args.interval)
         except KeyboardInterrupt:
             return 0
-    n = builder.drain_queue(store, cfg, quiet=args.quiet, llm=llm, verify=verify)
+    # One builder at a time: bounds CPU and the transient disk used by scratch worktrees. Later
+    # spawns wait for the lock, then drain whatever is left.
+    from .util import file_lock
+    try:
+        with file_lock(store.root / "builder.lock", timeout=6 * 3600):
+            n = builder.drain_queue(store, cfg, quiet=args.quiet, llm=llm, verify=verify)
+    except TimeoutError:
+        return 0
     if not args.quiet:
         print(f"built {n} queued episode(s)")
     return 0
@@ -270,6 +277,35 @@ def cmd_status(args) -> int:
     print(f"queue:     {store.queue_size()} pending")
     print(f"tasks:     {len(tasks)}  {by_tier}")
     print(f"auto_build={cfg.get('auto_build')} verify={cfg.get('verify')} llm={cfg.get('llm', {}).get('enabled')}")
+    from .gc import disk_usage, human
+    du = disk_usage(store)
+    print(f"disk:      store {human(du['store_bytes'])} (tasks {human(du['tasks_bytes'])}); "
+          f"pinned snapshot objects in repos {human(du['pinned_bytes_total'])}")
+    for r in du["repos"]:
+        if r.get("missing"):
+            print(f"           {r['name']}: repo missing")
+        else:
+            print(f"           {r['name']}: {r['snapshot_refs']} snapshot refs, {human(r['snapshot_bytes'])}")
+    return 0
+
+
+def cmd_gc(args) -> int:
+    from . import gitsnap
+    from .gc import disk_usage, human, prune_snapshots, rotate_logs
+    store = _store()
+    removed = prune_snapshots(store, days=args.days, dry_run=args.dry_run)
+    verb = "would unpin" if args.dry_run else "unpinned"
+    print(f"{verb} {len(removed)} snapshot ref(s)")
+    if not args.dry_run:
+        rotate_logs(store)
+    if args.git_gc or args.prune_now:
+        for r in store.repos():
+            repo = Path(r["path"])
+            if repo.exists() and not args.dry_run:
+                gitsnap.garbage_collect(repo, prune_now=args.prune_now)
+                print(f"git gc {'--prune=now ' if args.prune_now else ''}in {repo}")
+    du = disk_usage(store)
+    print(f"store {human(du['store_bytes'])}; pinned snapshot objects {human(du['pinned_bytes_total'])}")
     return 0
 
 
@@ -296,6 +332,70 @@ def cmd_config(args) -> int:
         print(f"{args.key} = {json.dumps(value)}")
         return 0
     print(json.dumps(cfg, indent=2))
+    return 0
+
+
+def cmd_remote(args) -> int:
+    from . import remote as rmod
+    cfg = config.load_config()
+    if args.action == "set":
+        cfg.setdefault("remote", {})["url"] = args.url
+        config.save_config(cfg)
+        print(f"remote = {args.url}")
+        return 0
+    if args.action == "index":
+        r = rmod.open_remote(args.url)
+        n = r.rebuild_index()
+        print(f"indexed {n} task(s) in {r.url}")
+        return 0
+    if args.action == "ls":
+        for m in rmod.iter_tasks(args.url, tiers=args.tier or None, use_index=not args.no_index):
+            print(f"{m['id']}  tier={m.get('tier'):<10} lang={m.get('language')} F2P={len(m.get('FAIL_TO_PASS', []))}")
+        return 0
+    # status
+    url = args.url or os.environ.get("REPOGYM_REMOTE") or (cfg.get("remote") or {}).get("url")
+    print(f"remote:      {url or '(none)'}")
+    rc = cfg.get("remote") or {}
+    print(f"auto_sync={rc.get('auto_sync')} purge_local={rc.get('purge_local')} tiers={rc.get('tiers')}")
+    if url:
+        store = _store()
+        local = store.tasks()
+        synced = sum(1 for t in local if rmod.is_synced(store.root, t["id"]))
+        print(f"local tasks: {len(local)} ({synced} synced)")
+        try:
+            r = rmod.open_remote(url)
+            print(f"remote tasks: {len(r.list_task_ids())}")
+        except Exception as e:  # noqa: BLE001
+            print(f"remote unreachable: {e}")
+    return 0
+
+
+def cmd_sync(args) -> int:
+    from .remote import sync_all, open_remote
+    store = _store()
+    remote = open_remote(args.remote)
+    n = sync_all(store, remote, purge_local=True if args.purge_local else None, force=args.force,
+                 tiers=args.tier or None, quiet=args.quiet)
+    if args.index:
+        remote.rebuild_index()
+    print(f"pushed {n} task(s) to {remote.url}")
+    return 0
+
+
+def cmd_pull(args) -> int:
+    from .remote import open_remote, pull_task
+    store = _store()
+    remote = open_remote(args.remote)
+    ids = list(args.task)
+    if args.all:
+        ids = remote.list_task_ids()
+    n = 0
+    for tid in ids:
+        dest = pull_task(store, tid, remote, refresh=args.refresh)
+        n += 1
+        if not args.quiet:
+            print(f"{tid} -> {dest}")
+    print(f"pulled {n} task(s) from {remote.url}")
     return 0
 
 
@@ -405,6 +505,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("status", help="overview of captured data")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("remote", help="configure/inspect the shared task store (S3, GCS, shared dir)")
+    s.add_argument("action", nargs="?", choices=["status", "set", "ls", "index"], default="status")
+    s.add_argument("url", nargs="?", help="s3://bucket/prefix | gs://bucket/prefix | file:///path")
+    s.add_argument("--tier", action="append")
+    s.add_argument("--no-index", action="store_true", help="ls: list objects instead of reading index.jsonl")
+    s.set_defaults(fn=cmd_remote)
+
+    s = sub.add_parser("sync", help="push local tasks to the remote")
+    s.add_argument("--remote", help="override the configured remote URL")
+    s.add_argument("--purge-local", action="store_true", help="delete local task dirs after upload")
+    s.add_argument("--force", action="store_true", help="re-upload tasks already marked synced")
+    s.add_argument("--tier", action="append")
+    s.add_argument("--index", action="store_true", help="rebuild index.jsonl afterwards")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("pull", help="fetch tasks from the remote into the local cache")
+    s.add_argument("task", nargs="*")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--remote")
+    s.add_argument("--refresh", action="store_true")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_pull)
+
+    s = sub.add_parser("gc", help="unpin old snapshots, rotate logs, report disk usage")
+    s.add_argument("--days", type=int, help="retention in days (default: config snapshot_retention_days)")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--git-gc", action="store_true", help="also run `git gc` in each captured repo")
+    s.add_argument("--prune-now", action="store_true", help="git gc --prune=now (reclaims space immediately)")
+    s.set_defaults(fn=cmd_gc)
 
     s = sub.add_parser("config", help="get/set configuration")
     s.add_argument("action", nargs="?", choices=["get", "set"], default=None)

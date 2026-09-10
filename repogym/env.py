@@ -36,6 +36,28 @@ from .verify import (TIER_SUITE, TIER_VERIFIED, locate_repo, materialize, reset_
 Obs = Dict[str, Any]
 
 
+def resolve_task(task: str, store: Store) -> Tuple[dict, Path]:
+    """Accept a task directory, a local task id, a remote task URL (s3://.../tasks/<id>) or an id
+    that only exists in the configured remote. Returns (task.json contents, local task dir)."""
+    from .remote import pull_task, split_task_url, open_remote
+    p = Path(str(task)).expanduser()
+    if (p / "task.json").exists():
+        return read_json(p / "task.json"), p
+    local = store.task_dir(str(task))
+    if (local / "task.json").exists():
+        return read_json(local / "task.json"), local
+    parts = split_task_url(str(task))
+    if parts:
+        base_url, tid = parts
+        tdir = pull_task(store, tid, remote=open_remote(base_url))
+        return read_json(tdir / "task.json"), tdir
+    cached = store.root / "cache" / "tasks" / str(task)
+    if (cached / "task.json").exists():
+        return read_json(cached / "task.json"), cached
+    tdir = pull_task(store, str(task))  # configured remote
+    return read_json(tdir / "task.json"), tdir
+
+
 class RepoGymEnv:
     metadata = {"render_modes": ["ansi"]}
 
@@ -46,13 +68,13 @@ class RepoGymEnv:
                  output_limit: int = 20000):
         self.store = store or Store()
         self.cfg = cfg or config.load_config()
-        self.task = self.store.load_task(str(Path(task).expanduser()))
-        tdir = Path(task).expanduser()
-        self.task_dir = tdir if (tdir / "task.json").exists() else self.store.task_dir(self.task["id"])
+        self.task, self.task_dir = resolve_task(task, self.store)
         self.files = task_files(self.task_dir)
         self.repo = Path(repo) if repo else locate_repo(self.task, self.store.root)
         if self.repo is None:
-            raise RuntimeError(f"no local repository for task {self.task['id']}; pass repo=...")
+            # Training box: no engineer checkout here. Clone from the recorded remote.
+            from .clones import ensure_repo
+            self.repo = ensure_repo(self.task, self.task_dir, self.store.root)
         self.workdir = Path(workdir) if workdir else None
         self.hidden_tests = hidden_tests
         self.timeout = timeout

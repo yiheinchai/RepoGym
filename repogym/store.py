@@ -196,6 +196,8 @@ class Store:
             t = read_json(p / "task.json")
         else:
             t = read_json(self.task_dir(task_id_or_path) / "task.json")
+            if not t:
+                t = read_json(self.root / "cache" / "tasks" / task_id_or_path / "task.json")
         if not t:
             raise FileNotFoundError(f"task not found: {task_id_or_path}")
         return t
