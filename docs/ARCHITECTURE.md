@@ -24,6 +24,7 @@
 | `store` | `~/.repogym` layout: repos, episodes, events, queue (atomic claim by rename), tasks |
 | `testrunners` | test-path heuristics, test-command classification, runner detection, machine-readable invocations, parsers (junit/jest/vitest/go/cargo/rspec) |
 | `builder` | episode → task: diff split, verification, tiering, task directory |
+| `deps` | lockfile detection, per-(repo, lockfile hash) provisioning cache, linking into worktrees |
 | `verify` | materialize base (snapshot or `head_commit` + `base.patch`), apply candidate + hidden tests, run, score |
 | `env` | `RepoGymEnv` (+ gymnasium wrapper) |
 | `export` | SWE-bench / full JSONL, git bundle |
@@ -98,6 +99,16 @@ history rewrites upstream do not invalidate the gym. The mirror costs roughly th
 size once, plus deltas; tasks stay tiny. What the mirror does *not* carry is the toolchain (interpreter,
 installed packages). Tasks record detected versions under `toolchain` so a container image can be built
 to match; that is the next layer.
+
+## Dependencies
+
+`deps.detect` runs on the base checkout at build time and the result is stored in `task.json` under
+`deps`. `verify.materialize` (used by the builder, the verifier and the env) calls `deps.ensure`, which
+installs into `~/.repogym/deps/<repo_id>/<manager>-<lockhash>/` under a file lock and symlinks the
+resulting directory into the worktree. Python venvs are created directly in the cache (they are not
+relocatable); node_modules / vendor are installed in the worktree and moved. Go and cargo only warm
+their global caches. A `.failed` marker with the install log stops repeated attempts; `repogym deps`
+retries explicitly. The engineer's own dirs, when present, win over provisioning.
 
 ## Reward
 

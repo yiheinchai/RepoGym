@@ -51,10 +51,18 @@ def locate_repo(task: dict, store_root: Optional[Path] = None, repo_override: Op
     return None
 
 
+LAST_DEPS_STATUS: Dict = {}
+
+
 @contextlib.contextmanager
 def materialize(task: dict, repo: Path, cfg: Optional[dict] = None, base_dir: Optional[Path] = None,
-                keep: bool = False, task_dir: Optional[Path] = None) -> Iterator[Path]:
-    """Yield a scratch checkout of the task's base state (with dependency dirs linked in)."""
+                keep: bool = False, task_dir: Optional[Path] = None, provision: bool = True,
+                store_root: Optional[Path] = None) -> Iterator[Path]:
+    """Yield a scratch checkout of the task's base state with dependencies available.
+
+    Dependencies come from (in order) the engineer's own git-ignored dirs linked in, then the
+    provisioning cache (installed once per lockfile hash), then `setup_cmd`.
+    """
     cfg = cfg or config.load_config()
     base_commit = task["base_commit"]
     head_commit = task.get("head_commit")
@@ -73,6 +81,16 @@ def materialize(task: dict, repo: Path, cfg: Optional[dict] = None, base_dir: Op
         if need_base_patch and files.get("base"):
             gitsnap.apply_patch(wt, files["base"])
         gitsnap.link_ignored_dirs(repo, wt, cfg.get("link_dirs", []))
+        if provision and (cfg.get("deps") or {}).get("mode", "auto") != "off":
+            from . import deps as depsmod
+            spec = task.get("deps")
+            if spec is None:
+                spec = depsmod.detect(wt, task.get("runner"))
+            LAST_DEPS_STATUS.clear()
+            LAST_DEPS_STATUS.update(depsmod.ensure(
+                spec, wt, store_root or config.home(), (task.get("repo") or {}).get("id") or "repo",
+                timeout=(cfg.get("deps") or {}).get("timeout", 1800),
+                setup_cmd=task.get("setup_cmd") or cfg.get("setup_cmd"), runner=task.get("runner")))
         yield wt
 
 
@@ -96,8 +114,7 @@ def run_task_tests(task: dict, wt: Path, cfg: dict, timeout: Optional[float] = N
     targets = task.get("test_targets") or []
     # Only pass targets that exist in the checkout; a deleted test file would abort the run.
     targets = [t for t in targets if (wt / t).exists()]
-    return run_tests(runner, wt, targets, timeout=timeout or cfg.get("test_timeout", 900),
-                     setup_cmd=task.get("setup_cmd") or cfg.get("setup_cmd"))
+    return run_tests(runner, wt, targets, timeout=timeout or cfg.get("test_timeout", 900))
 
 
 def score(task: dict, result: Optional[RunResult], candidate_patch: str = "", gold_patch: str = "",
@@ -152,7 +169,7 @@ def verify_patch(task: dict, task_dir: Path, candidate_patch: str, repo: Optiona
     repo = repo or locate_repo(task, store_root)
     if repo is None:
         raise RuntimeError("no local repository available for this task")
-    with materialize(task, repo, cfg, task_dir=task_dir) as wt:
+    with materialize(task, repo, cfg, task_dir=task_dir, store_root=store_root) as wt:
         applied = True
         apply_error = None
         try:

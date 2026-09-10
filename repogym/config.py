@@ -33,6 +33,10 @@ DEFAULTS: Dict[str, Any] = {
     "link_dirs": ["node_modules", ".venv", "venv", ".tox", "vendor", "target", ".gradle", ".m2"],
     # Optional shell command run inside a scratch worktree before tests (e.g. "npm ci").
     "setup_cmd": None,
+    # Dependency provisioning for scratch checkouts (training boxes have no node_modules/.venv):
+    #   auto  = detect from lockfiles, install once per lockfile hash into ~/.repogym/deps, link in
+    #   off   = only link the engineer's own dirs / run setup_cmd
+    "deps": {"mode": "auto", "timeout": 1800},
     # Store full (scrubbed) tool inputs in the trajectory, not just summaries.
     "capture_tool_inputs": "summary",  # "summary" | "full" | "none"
     # Ask an LLM to rewrite raw prompts into a clean, solution-free problem statement.

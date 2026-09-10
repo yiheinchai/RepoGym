@@ -168,7 +168,8 @@ More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `verify` | `true` | run tests to discover F2P/P2P |
 | `test_timeout` | `900` | seconds per test run |
 | `link_dirs` | node_modules, .venv, … | git-ignored dirs symlinked into scratch worktrees |
-| `setup_cmd` | `null` | shell command to run in a worktree before tests (e.g. `npm ci`) |
+| `setup_cmd` | `null` | extra shell command run in every scratch checkout after provisioning |
+| `deps.mode` / `deps.timeout` | `auto` / `1800` | lockfile-driven dependency provisioning into a per-hash cache (`off` to disable) |
 | `capture_tool_inputs` | `summary` | `none` / `summary` / `full` (scrubbed) trajectory detail |
 | `exclude_globs` | .env, *.pem, *secret*, … | files dropped from every stored patch |
 | `llm.enabled` | `false` | rewrite prompts into clean issue-style problem statements (Anthropic API) |
@@ -222,13 +223,35 @@ at a network volume; the per-machine cost is then just the transient worktree.
 Capture is a team decision, but every individual keeps a switch: set `REPOGYM_OPT_OUT=1` in your
 shell, or drop a `.repogym-optout` file in a repository, and RepoGym records nothing there.
 
+## Dependencies: the agent starts in a working checkout
+
+The policy should solve the task, not run `npm ci`. Every scratch checkout gets its dependencies
+before the agent sees it:
+
+1. On the engineer's machine, their own git-ignored dirs (`node_modules`, `.venv`, …) are symlinked in.
+2. Otherwise RepoGym provisions from the task's recorded **deps spec**: at build time it inspects the
+   base checkout for lockfiles and records the manager, lockfile hash and install command in
+   `task.json`. At `reset()` it installs once per `(repo, lockfile hash)` into `~/.repogym/deps/…`
+   and symlinks the result in. A thousand episodes on one lockfile share one install.
+3. `setup_cmd` (config or task) runs afterwards for anything bespoke.
+
+Detected managers: npm / pnpm / yarn / bun (from the lockfile present), pip requirements, pyproject
+(`pip install -e .[dev,test]`), uv, poetry, bundler, go, cargo. Agent shell steps run with the
+provisioned `.venv/bin` and `node_modules/.bin` first on `PATH`, so `pytest`, `jest`, `python` behave
+as they would for a developer. `repogym deps --all` warms the cache before a training run; failures
+are recorded per cache entry and surfaced in `info["deps"]` rather than retried on every reset.
+
+What is *not* controlled: the interpreter and system toolchain versions. Tasks record what the
+engineer had under `toolchain`; matching it exactly means building a container from that record,
+which is the next layer.
+
 ## Caveats (read before trusting a reward)
 
-- Scratch worktrees reuse the engineer's dependency directories via symlinks. For Python projects that
-  are `pip install -e .`'d, RepoGym prepends the worktree to `PYTHONPATH` so the code under test is the
-  worktree's, but compiled extensions or generated files that live outside the tree can still leak. For
-  publication-grade rigour, run verification in a container built from `head_commit` (`repogym bundle`
-  gives you the snapshots).
+- Provisioning installs whatever the lockfile says, on whatever interpreter the training box has. For
+  Python projects that are `pip install -e .`'d, RepoGym prepends the worktree to `PYTHONPATH` so the
+  code under test is the worktree's, but compiled extensions or generated files that live outside the
+  tree can still leak. For publication-grade rigour, run verification in a container built from the
+  mirror plus `toolchain`.
 - Codex only reports when a turn *ends*, so its first turn per thread has an approximate base
   (flagged `base_uncertain`). Subsequent turns are exact. Prefer the experimental hooks
   (`repogym install codex --hooks`) or `repogym wrap` for exact bases.

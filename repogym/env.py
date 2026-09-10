@@ -94,11 +94,14 @@ class RepoGymEnv:
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Obs, dict]:
         self.close()
         self._ctx = materialize(self.task, self.repo, self.cfg, base_dir=self.workdir, keep=self.keep,
-                                task_dir=self.task_dir)
+                                task_dir=self.task_dir, store_root=self.store.root)
         self.repo_path = self._ctx.__enter__()
+        from .verify import LAST_DEPS_STATUS
+        self.deps_status = dict(LAST_DEPS_STATUS)
         self.steps = 0
         self.done = False
-        return self._obs(last_output=""), {"task_id": self.task["id"], "tier": self.task.get("tier")}
+        return self._obs(last_output=""), {"task_id": self.task["id"], "tier": self.task.get("tier"),
+                                           "deps": self.deps_status}
 
     def step(self, action) -> Tuple[Obs, float, bool, bool, dict]:
         if self.done or self.repo_path is None:
@@ -190,9 +193,25 @@ class RepoGymEnv:
             "language": self.task.get("language"),
             "repo_path": str(self.repo_path) if self.repo_path else None,
             "runner": self.task.get("runner"),
+            "deps_ready": not (getattr(self, "deps_status", {}) or {}).get("failed"),
             "step": self.steps,
             "last_output": truncate(last_output, self.output_limit),
         }
+
+    def shell_env(self) -> dict:
+        """Environment for agent shell commands: provisioned venv / node_modules/.bin first on PATH."""
+        env = {**os.environ, "REPOGYM_TASK": self.task["id"], "CI": "1"}
+        path_parts = []
+        venv = self.repo_path / ".venv"
+        if (venv / "bin").is_dir():
+            path_parts.append(str(venv / "bin"))
+            env["VIRTUAL_ENV"] = str(venv.resolve())
+        nbin = self.repo_path / "node_modules" / ".bin"
+        if nbin.is_dir():
+            path_parts.append(str(nbin))
+        if path_parts:
+            env["PATH"] = os.pathsep.join(path_parts + [env.get("PATH", "")])
+        return env
 
     def _shell(self, command: str) -> str:
         if not command.strip():
@@ -200,7 +219,7 @@ class RepoGymEnv:
         try:
             proc = subprocess.run(command, shell=True, cwd=str(self.repo_path), capture_output=True, text=True,
                                   errors="replace", timeout=self.shell_timeout, stdin=subprocess.DEVNULL,
-                                  env={**os.environ, "REPOGYM_TASK": self.task["id"], "CI": "1"})
+                                  env=self.shell_env())
             out = proc.stdout
             if proc.stderr:
                 out += ("\n" if out else "") + proc.stderr

@@ -130,6 +130,7 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
         targets = [t for t in split_test_command_targets(ep.test_commands[-1]) if (repo / t).exists()
                    or gitsnap.git(["cat-file", "-e", f"{final}:{t}"], cwd=repo, check=False).returncode == 0]
 
+    deps_spec: Optional[dict] = None
     before: Optional[RunResult] = None
     after: Optional[RunResult] = None
     tier = TIER_UNVERIFIED
@@ -138,7 +139,8 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
     verify_note = None
     if verify and runner:
         _log(quiet, f"[repogym] verifying {ep.id} with {runner} on {len(targets) or 'all'} target(s)")
-        before, after = _run_before_after(repo, base, test_patch, src_patch, runner, targets, cfg)
+        before, after, deps_spec = _run_before_after(repo, base, test_patch, src_patch, runner, targets, cfg,
+                                                     store.root, ep.repo_id)
         tier, f2p, p2p, verify_note = _derive_tier(before, after, test_files)
     elif verify and not runner:
         verify_note = "no test runner detected"
@@ -180,6 +182,8 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
         "final_commit": final,
         "snapshot_refs": [ep.base.get("ref"), ep.final.get("ref")],
         "runner": runner,
+        "deps": deps_spec,
+        "setup_cmd": cfg.get("setup_cmd"),
         "test_targets": targets,
         "test_files": test_files,
         "source_files": src_files,
@@ -233,19 +237,26 @@ def _build(ep: Episode, store: Store, cfg: dict, use_llm: bool, verify: bool, qu
 
 
 def _run_before_after(repo: Path, base: str, test_patch: str, src_patch: str, runner: str,
-                      targets: List[str], cfg: dict) -> Tuple[RunResult, RunResult]:
+                      targets: List[str], cfg: dict, store_root: Optional[Path] = None,
+                      repo_id: str = "repo") -> Tuple[RunResult, RunResult, Optional[dict]]:
     timeout = cfg.get("test_timeout", 900)
+    from . import deps as depsmod
     with gitsnap.worktree(repo, base) as wt:
         gitsnap.link_ignored_dirs(repo, wt, cfg.get("link_dirs", []))
+        deps_spec = depsmod.detect(wt, runner)
+        if (cfg.get("deps") or {}).get("mode", "auto") != "off":
+            depsmod.ensure(deps_spec, wt, store_root or config.home(), repo_id,
+                           timeout=(cfg.get("deps") or {}).get("timeout", 1800), setup_cmd=cfg.get("setup_cmd"),
+                           runner=runner)
         if test_patch:
             gitsnap.apply_patch(wt, test_patch)
         existing_targets = [t for t in targets if (wt / t).exists()]
-        before = run_tests(runner, wt, existing_targets, timeout=timeout, setup_cmd=cfg.get("setup_cmd"))
+        before = run_tests(runner, wt, existing_targets, timeout=timeout)
         if src_patch:
             gitsnap.apply_patch(wt, src_patch)
         existing_targets = [t for t in targets if (wt / t).exists()]
-        after = run_tests(runner, wt, existing_targets, timeout=timeout, setup_cmd=cfg.get("setup_cmd"))
-    return before, after
+        after = run_tests(runner, wt, existing_targets, timeout=timeout)
+    return before, after, deps_spec
 
 
 def _derive_tier(before: RunResult, after: RunResult, test_files: List[str]) -> Tuple[str, List[str], List[str], Optional[str]]:

@@ -449,6 +449,30 @@ def cmd_mirror(args) -> int:
     return 0
 
 
+def cmd_deps(args) -> int:
+    """Pre-provision dependencies for tasks so training never waits on installs."""
+    from .deps import warm
+    from .env import resolve_task
+    from .verify import locate_repo
+    from .clones import ensure_repo
+    store = _store()
+    cfg = config.load_config()
+    ids = list(args.task)
+    if args.all:
+        ids = [t["id"] for t in store.tasks()]
+    seen = set()
+    for tid in ids:
+        task, tdir, bucket = resolve_task(tid, store)
+        key = json.dumps(task.get("deps"), sort_keys=True) + str((task.get("repo") or {}).get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        repo = locate_repo(task, store.root) or ensure_repo(task, tdir, store.root, bucket=bucket)
+        status = warm(task, repo, store.root, cfg)
+        print(f"{task['id']}: provisioned={status['provisioned']} linked={status['linked']} failed={status['failed']}")
+    return 0
+
+
 def cmd_delete(args) -> int:
     store = _store()
     for tid in args.task:
@@ -579,6 +603,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--refresh", action="store_true")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_pull)
+
+    s = sub.add_parser("deps", help="pre-install task dependencies into the provisioning cache")
+    s.add_argument("task", nargs="*")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(fn=cmd_deps)
 
     s = sub.add_parser("mirror", help="repository history in the bucket: status | push | restore")
     s.add_argument("action", nargs="?", choices=["status", "push", "restore"], default="status")
