@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repogym"
+version = "0.1.0"
+description = "Turn your engineers' Claude Code / Codex sessions into a private RL gym of verifiable coding tasks."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "RepoGym contributors" }]
+keywords = ["reinforcement-learning", "gym", "swe-bench", "claude-code", "codex", "coding-agents"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Software Development",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Zero required dependencies: the capture path runs inside editor hooks and must be
+# fast and boring. Everything optional lives in extras.
+dependencies = []
+
+[project.optional-dependencies]
+llm = ["anthropic>=1.0"]
+gym = ["gymnasium>=0.29"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+repogym = "repogym.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yiheinchai/RepoGym"
+
+[tool.setuptools.packages.find]
+include = ["repogym*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
