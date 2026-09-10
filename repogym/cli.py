@@ -419,12 +419,21 @@ def cmd_mirror(args) -> int:
         return 0
     if args.action == "restore":
         from .clones import clone_root
-        m = None
+        from .mirror import get_manifest
+        repo_id, name = None, None
         for r in store.repos():
             if r["id"] == args.repo or r["name"] == args.repo:
-                m = r
-        repo_id = m["id"] if m else args.repo
-        name = m["name"] if m else args.repo
+                repo_id, name = r["id"], r["name"]
+        if repo_id is None:
+            # Fresh machine: resolve the name from the manifests in the bucket.
+            for rid in remote.list_dirs("repos/"):
+                m = get_manifest(remote, rid)
+                if m and (rid == args.repo or m.get("name") == args.repo):
+                    repo_id, name = rid, m.get("name") or rid
+                    break
+        if repo_id is None:
+            print(f"unknown repo: {args.repo}", file=sys.stderr)
+            return 1
         dest = restore_mirror(remote, repo_id, clone_root(store.root) / name)
         print(f"restored to {dest}" if dest else "no mirror for that repo in the remote")
         return 0 if dest else 1
